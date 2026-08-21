@@ -4,6 +4,7 @@ import au.com.dius.pact.core.model.BrokerUrlSource
 import au.com.dius.pact.core.model.Consumer
 import au.com.dius.pact.core.model.FileSource
 import au.com.dius.pact.core.model.OptionalBody
+import au.com.dius.pact.core.model.Pact
 import au.com.dius.pact.core.model.Provider
 import au.com.dius.pact.core.model.Request
 import au.com.dius.pact.core.model.RequestResponseInteraction
@@ -24,6 +25,12 @@ import spock.lang.Issue
 import spock.lang.Specification
 import spock.lang.Unroll
 import spock.util.environment.RestoreSystemProperties
+
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CyclicBarrier
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 @SuppressWarnings('UnnecessaryGetter')
 class TestResultAccumulatorSpec extends Specification {
@@ -455,4 +462,79 @@ class TestResultAccumulatorSpec extends Specification {
     cleanup:
     testResultAccumulator.verificationReporter = reporter
   }
+
+    def 'updateTestResult - does not lose verification results when interactions are verified concurrently'() {
+        given: 'a large number of distinct pacts, each with several interactions'
+        def pactCount = 100
+        def interactionsPerPact = 2
+        def pacts = createPacts(pactCount, interactionsPerPact)
+        testResultAccumulator.testResults.clear()
+        def originalReporter = testResultAccumulator.verificationReporter
+
+        and: 'a mock reporter that records every consumer it is asked to publish results for'
+        def reportedConsumers = new ConcurrentLinkedQueue<String>()
+        testResultAccumulator.verificationReporter = Mock(VerificationReporter) {
+            reportResults(_, _, _, _, _, _) >> { args ->
+                reportedConsumers << ((Pact) args[0]).consumer.name
+                new Result.Ok(true)
+            }
+        }
+
+        and: 'a CyclicBarrier per pact to synchronize all interactions, triggering concurrent race conditions'
+        def barriersByPact = pacts.collectEntries { pact -> [(pact): new CyclicBarrier(interactionsPerPact)] }
+
+        when: 'every interaction of every pact is verified concurrently, on its own thread'
+        def completed = verifyAllInteractionsConcurrently(pacts) { pact, interaction ->
+            barriersByPact[pact].await()
+            testResultAccumulator.updateTestResult(pact, interaction, new TestResult.Ok(), null, Mock(ValueResolver))
+        }
+
+        and: 'work out which consumers were never published i.e. lost updates'
+        def allConsumerNames = (1..pactCount).collect { "consumer${it}" } as Set
+        def missingConsumers = allConsumerNames - (reportedConsumers as Set)
+
+        then: 'every pact must have been reported to the broker - none silently dropped'
+        completed
+        missingConsumers.isEmpty()
+
+        cleanup:
+        testResultAccumulator.verificationReporter = originalReporter
+    }
+
+    private static List<RequestResponsePact> createPacts(int pactCount, int interactionsPerPact) {
+        (1..pactCount).collect { pactIndex ->
+            def interactions = (1..interactionsPerPact).collect { interactionIndex ->
+                new RequestResponseInteraction(
+                        "interaction${pactIndex}_${interactionIndex}", [], new Request(), new Response())
+            }
+            new RequestResponsePact(new Provider('provider'), new Consumer("consumer${pactIndex}"), interactions)
+        }
+    }
+
+    /**
+     * Submits, for every (pact, interaction) pair, a task that runs verifyInteraction on its own thread from a
+     * bounded thread pool, then waits (up to 10 seconds) for every task to finish.
+     * Returns true if all tasks completed within that time.
+     */
+    private static boolean verifyAllInteractionsConcurrently(
+            List<RequestResponsePact> pacts,
+            Closure verifyInteraction) {
+        def tasks = pacts.collectMany { pact -> pact.interactions.collect { interaction -> [pact, interaction] } }
+        def executor = Executors.newFixedThreadPool(Math.max(4, Runtime.getRuntime().availableProcessors() - 1))
+        def doneLatch = new CountDownLatch(tasks.size())
+        try {
+            tasks.each { pact, interaction ->
+                executor.submit {
+                    try {
+                        verifyInteraction(pact, interaction)
+                    } finally {
+                        doneLatch.countDown()
+                    }
+                }
+            }
+            return doneLatch.await(10, TimeUnit.SECONDS)
+        } finally {
+            executor.shutdown()
+        }
+    }
 }

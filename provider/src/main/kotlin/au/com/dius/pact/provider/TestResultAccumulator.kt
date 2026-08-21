@@ -12,6 +12,7 @@ import au.com.dius.pact.core.support.isNotEmpty
 import au.com.dius.pact.provider.ProviderVerifier.Companion.PACT_VERIFIER_PUBLISH_RESULTS
 import io.github.oshai.kotlinlogging.KLogging
 import org.apache.commons.lang3.builder.HashCodeBuilder
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Accumulates the test results for the interactions. Once all the interactions for a pact have been verified,
@@ -37,7 +38,7 @@ interface TestResultAccumulator {
 
 object DefaultTestResultAccumulator : TestResultAccumulator, KLogging() {
 
-  val testResults: MutableMap<Int, MutableMap<Int, TestResult>> = mutableMapOf()
+  val testResults: MutableMap<Int, MutableMap<Int, TestResult>> = ConcurrentHashMap()
   var verificationReporter: VerificationReporter = DefaultVerificationReporter
 
   override fun updateTestResult(
@@ -63,40 +64,49 @@ object DefaultTestResultAccumulator : TestResultAccumulator, KLogging() {
     logger.debug { "Received test result '$testExecutionResult' for Pact ${pact.provider.name}-${pact.consumer.name} " +
       "and ${interaction.description} (${source?.description()})" }
     val pactHash = calculatePactHash(pact, source)
-    val interactionResults = testResults.getOrPut(pactHash) { mutableMapOf() }
+    val interactionResults = testResults.computeIfAbsent(pactHash) { mutableMapOf() }
     val interactionHash = calculateInteractionHash(interaction)
-    val testResult = interactionResults[interactionHash]
-    if (testResult == null) {
-      interactionResults[interactionHash] = testExecutionResult
-    } else {
-      interactionResults[interactionHash] = testResult.merge(testExecutionResult)
-    }
-    val unverifiedInteractions = unverifiedInteractions(pact, interactionResults)
-    return if (unverifiedInteractions.isEmpty()) {
-      logger.debug {
-        "All interactions for Pact ${pact.provider.name}-${pact.consumer.name} have a verification result"
-      }
-      val result = if (verificationReporter.publishingResultsDisabled(propertyResolver)) {
-        logger.warn {
-          "Skipping publishing of verification results as it has been disabled " +
-            "($PACT_VERIFIER_PUBLISH_RESULTS is not 'true')"
+    return synchronized(interactionResults) {
+        val testResult = interactionResults[interactionHash]
+        if (testResult == null) {
+          interactionResults[interactionHash] = testExecutionResult
+        } else {
+          interactionResults[interactionHash] = testResult.merge(testExecutionResult)
         }
-        Result.Ok(false)
-      } else {
-        val calculatedTestResult = interactionResults.values.reduce { acc: TestResult, result -> acc.merge(result) }
-        verificationReporter.reportResults(pact, calculatedTestResult, lookupProviderVersion(propertyResolver),
-          null, lookupProviderTags(propertyResolver), lookupProviderBranch(propertyResolver))
+        val unverifiedInteractions = unverifiedInteractions(pact, interactionResults)
+        if (unverifiedInteractions.isEmpty()) {
+          logger.debug {
+            "All interactions for Pact ${pact.provider.name}-${pact.consumer.name} have a verification result"
+          }
+          val result = if (verificationReporter.publishingResultsDisabled(propertyResolver)) {
+            logger.warn {
+              "Skipping publishing of verification results as it has been disabled " +
+                "($PACT_VERIFIER_PUBLISH_RESULTS is not 'true')"
+            }
+            Result.Ok(false)
+          } else {
+            val calculatedTestResult = interactionResults.values.reduce { acc: TestResult, result -> acc.merge(result) }
+            verificationReporter.reportResults(pact, calculatedTestResult, lookupProviderVersion(propertyResolver),
+              null, lookupProviderTags(propertyResolver), lookupProviderBranch(propertyResolver))
+          }
+          testResults.remove(pactHash)
+          result
+        } else {
+          logger.warn {
+            "Not all of the ${pact.interactions.size} interactions were verified for " +
+              "provider=${pact.provider.name} consumer=${pact.consumer.name} (pactHash=$pactHash). " +
+              "The following were missing:"
+          }
+          unverifiedInteractions.forEach {
+            logger.warn {
+              "    provider=${pact.provider.name} consumer=${pact.consumer.name} " +
+                "(pactHash=$pactHash) missing: ${it.description}"
+            }
+          }
+          Result.Ok(true)
+        }
       }
-      testResults.remove(pactHash)
-      result
-    } else {
-      logger.warn { "Not all of the ${pact.interactions.size} were verified. The following were missing:" }
-      unverifiedInteractions.forEach {
-        logger.warn { "    ${it.description}" }
-      }
-      Result.Ok(true)
     }
-  }
 
   fun calculateInteractionHash(interaction: Interaction): Int {
     val builder = HashCodeBuilder().append(interaction.description)
